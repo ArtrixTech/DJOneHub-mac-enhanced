@@ -1168,8 +1168,38 @@ func securityHeaders(next http.Handler) http.Handler {
 		w.Header().Set("X-Content-Type-Options", "nosniff")
 		w.Header().Set("X-Frame-Options", "DENY")
 		w.Header().Set("Referrer-Policy", "no-referrer")
+		// Local hardening: block DNS rebinding (non-loopback Host) and
+		// cross-site browser requests, since the API can send SMS and run AT.
+		if !isLoopbackHostHeader(r.Host) {
+			http.Error(w, "forbidden host", http.StatusForbidden)
+			return
+		}
+		if origin := r.Header.Get("Origin"); origin != "" {
+			u, err := url.Parse(origin)
+			if err != nil || !isLoopbackHostHeader(u.Host) {
+				http.Error(w, "forbidden origin", http.StatusForbidden)
+				return
+			}
+		}
+		if site := r.Header.Get("Sec-Fetch-Site"); site == "cross-site" {
+			http.Error(w, "forbidden cross-site request", http.StatusForbidden)
+			return
+		}
 		next.ServeHTTP(w, r)
 	})
+}
+
+func isLoopbackHostHeader(hostport string) bool {
+	host := hostport
+	if h, _, err := net.SplitHostPort(hostport); err == nil {
+		host = h
+	}
+	host = strings.Trim(host, "[]")
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }
 
 func (a *app) health(w http.ResponseWriter, _ *http.Request) {
