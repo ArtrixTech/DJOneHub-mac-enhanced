@@ -166,6 +166,15 @@ type app struct {
 	// dhcpFailRounds counts consecutive ensureCellularDHCP rounds in which the
 	// modem had a cellular IPv4 bearer but macOS still got no DHCP lease.
 	dhcpFailRounds int
+	// ifaceMissingSince is when the cellular service's en* device was first
+	// seen absent (zero while present). ifaceMissingUnlockedSince is the same
+	// but only counts time with the screen unlocked; ifaceMissingReboots counts
+	// reboots spent on the current episode.
+	ifaceMissingSince         time.Time
+	ifaceMissingUnlockedSince time.Time
+	ifaceMissingReboots       int
+	lastIfaceMissingReboot    time.Time
+	lastConsoleLocked         bool
 }
 
 type usbInterfaceStatus struct {
@@ -1032,7 +1041,9 @@ func (a *app) signalRecoveryOnce() {
 
 	// The USB network interface rarely drops by itself, so only re-check
 	// DHCP every minute to avoid hammering networksetup.
-	if time.Since(a.lastNetworkCheck) >= 60*time.Second {
+	// While the adapter is missing with the screen unlocked, re-check every
+	// cycle (8 s) so the post-unlock reboot does not wait a full minute.
+	if a.cellularInterfaceNeedsAttention() || time.Since(a.lastNetworkCheck) >= 60*time.Second {
 		a.lastNetworkCheck = time.Now()
 		a.ensureCellularDHCP()
 	}
@@ -2185,7 +2196,7 @@ func (a *app) ensureCellularDHCP() {
 	// Find the DJI cellular network service. macOS may name it differently on
 	// a fresh machine ("Baiwang", "Baiwang 2", localized variants), and it may
 	// also be disabled, in which case DHCP renewals never apply.
-	var target string
+	var target, device string
 	for _, service := range services {
 		if !isDJICellularService(service) {
 			continue
@@ -2198,13 +2209,14 @@ func (a *app) ensureCellularDHCP() {
 			}
 		}
 		target = service.Name
+		device = service.Device
 		break
 	}
 	// No service yet: on a machine that never saw this module, macOS may not
 	// have created a network service for the modem's USB adapter. Create one
 	// so DHCP can be renewed automatically.
 	if target == "" {
-		device := findUnprovisionedUSBModemInterface(services)
+		device = findUnprovisionedUSBModemInterface(services)
 		if device == "" {
 			log.Printf("cellular DHCP repair: no DJI cellular network service and no unprovisioned USB interface")
 			return
@@ -2217,10 +2229,23 @@ func (a *app) ensureCellularDHCP() {
 		}
 		log.Printf("cellular DHCP repair: created network service %s on %s", target, device)
 	}
+	// A service whose en* device is gone cannot get a lease; renewing DHCP
+	// would only burn 30 s. See handleMissingCellularInterface.
+	if _, err := net.InterfaceByName(device); err != nil {
+		a.handleMissingCellularInterface(target, device)
+		return
+	}
+	if !a.ifaceMissingSince.IsZero() {
+		log.Printf("cellular interface: %s is back after %s", device, time.Since(a.ifaceMissingSince).Round(time.Second))
+	}
+	a.ifaceMissingSince = time.Time{}
+	a.ifaceMissingUnlockedSince = time.Time{}
+	a.ifaceMissingReboots = 0
 	if _, err := readMacIPv4ServiceInfo(target); err == nil {
 		a.dhcpFailRounds = 0
 		return
 	}
+	log.Printf("cellular DHCP repair: %s has no IPv4 (%s)", target, describeMacInterface(device))
 	const attempts = 2
 	for attempt := 1; attempt <= attempts; attempt++ {
 		if err := renewMacNetworkServiceDHCP(target); err != nil {
@@ -2275,6 +2300,12 @@ func (a *app) maybeRebootForStuckDHCP(usbnetResp string) {
 	if a.dhcpFailRounds < stuckDHCPRoundsBeforeReboot {
 		return
 	}
+	// A reboot under the lock screen re-enumerates the adapter with a new MAC,
+	// which macOS then refuses to attach (see handleMissingCellularInterface).
+	if locked, _ := consoleLocked(); locked {
+		log.Printf("cellular DHCP repair: screen is locked; deferring module reboot until unlock")
+		return
+	}
 	a.recoveryMu.Lock()
 	defer a.recoveryMu.Unlock()
 	if a.usbAT == nil || time.Since(a.lastModemReboot) < stuckDHCPRebootInterval {
@@ -2285,6 +2316,97 @@ func (a *app) maybeRebootForStuckDHCP(usbnetResp string) {
 	log.Printf("cellular DHCP repair: module DHCP server stuck; rebooting module (AT+CFUN=1,1)")
 	_, _ = a.usbAT.Command("AT+CFUN=1,1", 3*time.Second)
 	a.markUSBATDetached("cellular DHCP repair reboot")
+}
+
+// Seen in the field (2026-11-03): the module presents a new random ECM MAC on
+// every boot. If it re-enumerates while the screen is locked, configd logs
+// "Console locked, network interface[matching, unknown MAC] ignored" and never
+// creates en11, not even after unlock. Only another re-enumeration with the
+// screen unlocked brings it back. So: wait while locked, then reboot once.
+const (
+	missingIfaceGraceUnlocked = 20 * time.Second
+	missingIfaceRebootGap     = 3 * time.Minute
+	missingIfaceMaxReboots    = 2
+)
+
+func (a *app) handleMissingCellularInterface(service, device string) {
+	now := time.Now()
+	if a.ifaceMissingSince.IsZero() {
+		a.ifaceMissingSince = now
+	}
+	locked, known := consoleLocked()
+	lockState := "unlocked"
+	if !known {
+		lockState = "unknown"
+	} else if locked {
+		lockState = "locked"
+	}
+	missingFor := now.Sub(a.ifaceMissingSince).Round(time.Second)
+	if locked {
+		a.ifaceMissingUnlockedSince = time.Time{}
+		log.Printf("cellular interface: %s (service %s) missing for %s, screen locked; macOS ignores new USB adapters while locked, waiting for unlock", device, service, missingFor)
+		return
+	}
+	if a.ifaceMissingUnlockedSince.IsZero() {
+		a.ifaceMissingUnlockedSince = now
+	}
+	log.Printf("cellular interface: %s (service %s) missing for %s, screen %s", device, service, missingFor, lockState)
+	// Give a normal re-enumeration (any recent reboot included) time to finish.
+	if now.Sub(a.ifaceMissingUnlockedSince) < missingIfaceGraceUnlocked || now.Sub(a.lastModemReboot) < time.Minute {
+		return
+	}
+	if a.usbAT == nil {
+		return
+	}
+	usbnetResp, err := a.usbAT.Command(`AT+QCFG="usbnet"`, 3*time.Second)
+	if err != nil {
+		return
+	}
+	if !regexp.MustCompile(`"usbnet",\s*1\b`).MatchString(usbnetResp) {
+		log.Printf("cellular interface: module usbnet is not ECM (%s); not rebooting", strings.TrimSpace(usbnetResp))
+		return
+	}
+	if a.ifaceMissingReboots >= missingIfaceMaxReboots {
+		if a.ifaceMissingReboots == missingIfaceMaxReboots {
+			a.ifaceMissingReboots++
+			log.Printf("cellular interface: still missing after %d module reboots; unplug and replug the module", missingIfaceMaxReboots)
+		}
+		return
+	}
+	a.recoveryMu.Lock()
+	defer a.recoveryMu.Unlock()
+	if a.usbAT == nil || time.Since(a.lastIfaceMissingReboot) < missingIfaceRebootGap {
+		return
+	}
+	a.lastIfaceMissingReboot = now
+	a.lastModemReboot = now
+	a.ifaceMissingReboots++
+	a.ifaceMissingUnlockedSince = time.Time{}
+	log.Printf("cellular interface: rebooting module so macOS re-attaches %s with the screen unlocked (attempt %d/%d)", device, a.ifaceMissingReboots, missingIfaceMaxReboots)
+	_, _ = a.usbAT.Command("AT+CFUN=1,1", 3*time.Second)
+	a.markUSBATDetached("cellular interface missing reboot")
+}
+
+// cellularInterfaceNeedsAttention reports whether the cellular adapter is
+// currently missing with the screen unlocked, so the recovery loop should
+// re-check now instead of waiting for the 60 s DHCP cadence.
+func (a *app) cellularInterfaceNeedsAttention() bool {
+	locked, _ := consoleLocked()
+	wasLocked := a.lastConsoleLocked
+	a.lastConsoleLocked = locked
+	if wasLocked != locked {
+		log.Printf("console lock state: locked=%t", locked)
+	}
+	return !a.ifaceMissingSince.IsZero() && !locked
+}
+
+func describeMacInterface(device string) string {
+	for _, item := range discoverMacNetworkInterfaces() {
+		if item.Name == device {
+			return fmt.Sprintf("status=%s ipv4=%q mac=%s", item.Status, item.IPv4, item.MAC)
+		}
+	}
+	return "not in ifconfig"
 }
 
 // modemBearerReadyForDHCP reports whether the module is in ECM mode and holds
@@ -2630,6 +2752,7 @@ func (a *app) setUSBNetMode(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *app) rebootModule(w http.ResponseWriter, _ *http.Request) {
+	log.Printf("module reboot requested via API (AT+CFUN=1,1)")
 	response, err := a.runATCommand("AT+CFUN=1,1", 3*time.Second)
 	if err != nil {
 		writeError(w, http.StatusBadGateway, err.Error())
