@@ -412,7 +412,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func showCellularStatusItem(signalLevel: Int) {
         if cellularStatusItem == nil {
-            cellularStatusItem = NSStatusBar.system.statusItem(withLength: 48)
+            cellularStatusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
             cellularStatusItem?.button?.target = self
             cellularStatusItem?.button?.action = #selector(openDJOneHubFromCellularMenuBar)
         }
@@ -519,33 +519,44 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     // A compact stepped mobile-signal indicator that mirrors the iPhone
     // status bar: four signal bars on the left, a "4G" label on the right.
-    // The label is vertically centered and sized to the same height as the
-    // tallest signal bar (13.8pt). Drawn as a template image so macOS renders
+    // The label is vertically centered against the
+    // tallest signal bar. Drawn as a template image so macOS renders
     // it white on a dark menu bar and black on a light one, like iOS.
     private static func cellularStatusImage(signalLevel: Int) -> NSImage {
-        let image = NSImage(size: NSSize(width: 48, height: 18))
-        image.lockFocus()
         // 模板色：菜单栏深色时系统渲染为白色，浅色时自动变黑，与 iPhone 状态栏一致
         let color = NSColor.black
+        let label = "4G" as NSString
+        let attributes: [NSAttributedString.Key: Any] = [
+            .font: NSFont.systemFont(ofSize: 11, weight: .medium),
+            .foregroundColor: color,
+        ]
+        let labelSize = label.size(withAttributes: attributes)
+        let barHeights: [CGFloat] = [3.6, 6.2, 8.8, 11.4]
+        let barWidth: CGFloat = 3.0
+        let barStep: CGFloat = 4.3
+        let gap: CGFloat = 2.5
+        let barsWidth = barStep * CGFloat(barHeights.count - 1) + barWidth
+        let height: CGFloat = 18
+        // 宽度按内容计算，右侧不留空白
+        let width = ceil(barsWidth + gap + labelSize.width)
+        let image = NSImage(size: NSSize(width: width, height: height))
+        image.lockFocus()
         let active = color
         let inactive = color.withAlphaComponent(0.30)
-        for (index, height) in [4.2, 7.4, 10.6, 13.8].enumerated() {
+        let barBaseY = (height - barHeights.last!) / 2
+        for (index, barHeight) in barHeights.enumerated() {
             (index < signalLevel ? active : inactive).setFill()
             let bar = NSBezierPath(
-                roundedRect: NSRect(x: CGFloat(index) * 5.2, y: 1, width: 3.6, height: height),
-                xRadius: 0.9,
-                yRadius: 0.9
+                roundedRect: NSRect(x: CGFloat(index) * barStep, y: barBaseY, width: barWidth, height: barHeight),
+                xRadius: 0.8,
+                yRadius: 0.8
             )
             bar.fill()
         }
-        // "4G"：与菜单栏电量百分比同字号（menuBarFont 13pt、SF Pro 常规字重不加粗），垂直居中于信号条
-        let label = "4G" as NSString
+        // "4G" 垂直居中于最高信号条
         label.draw(
-            at: NSPoint(x: 22, y: 0.5),
-            withAttributes: [
-                .font: NSFont.systemFont(ofSize: 13, weight: .regular),
-                .foregroundColor: color,
-            ]
+            at: NSPoint(x: barsWidth + gap, y: (height - labelSize.height) / 2),
+            withAttributes: attributes
         )
         image.unlockFocus()
         image.isTemplate = true
