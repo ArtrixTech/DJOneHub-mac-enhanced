@@ -163,6 +163,9 @@ type app struct {
 	lostSignalCount  int
 	lastModemReboot  time.Time
 	lastNetworkCheck time.Time
+	// dhcpFailRounds counts consecutive ensureCellularDHCP rounds in which the
+	// modem had a cellular IPv4 bearer but macOS still got no DHCP lease.
+	dhcpFailRounds int
 }
 
 type usbInterfaceStatus struct {
@@ -2215,6 +2218,7 @@ func (a *app) ensureCellularDHCP() {
 		log.Printf("cellular DHCP repair: created network service %s on %s", target, device)
 	}
 	if _, err := readMacIPv4ServiceInfo(target); err == nil {
+		a.dhcpFailRounds = 0
 		return
 	}
 	const attempts = 2
@@ -2226,17 +2230,76 @@ func (a *app) ensureCellularDHCP() {
 		info, waitErr := waitForMacIPv4Service(target, 15*time.Second)
 		if waitErr == nil {
 			log.Printf("cellular DHCP repair: %s -> %s", target, info.Address)
+			a.dhcpFailRounds = 0
 			return
 		}
 		log.Printf("cellular DHCP repair: attempt %d/2: %v", attempt, waitErr)
 	}
 	// DHCP keeps failing: report the modem USB networking mode so a fresh
 	// machine can be diagnosed (usbnet=0 means the adapter never comes up).
-	if a.usbAT != nil {
-		if resp, err := a.usbAT.Command(`AT+QCFG="usbnet"`, 3*time.Second); err == nil {
-			log.Printf("cellular DHCP repair: AT+QCFG usbnet => %s", strings.TrimSpace(resp))
+	if a.usbAT == nil {
+		return
+	}
+	usbnetResp, err := a.usbAT.Command(`AT+QCFG="usbnet"`, 3*time.Second)
+	if err != nil {
+		return
+	}
+	log.Printf("cellular DHCP repair: AT+QCFG usbnet => %s", strings.TrimSpace(usbnetResp))
+	a.maybeRebootForStuckDHCP(usbnetResp)
+}
+
+// Seen in the field: after a USB re-enumeration the module keeps its LTE
+// bearer (CGPADDR has an IPv4 address, IPv6 RA still works) but its internal
+// DHCP server for the ECM link stops answering. Renewing on the Mac side does
+// not help; only a module reboot (AT+CFUN=1,1) brings the lease back.
+const (
+	stuckDHCPRoundsBeforeReboot = 2
+	stuckDHCPRebootInterval     = 10 * time.Minute
+)
+
+// maybeRebootForStuckDHCP reboots the module when DHCP has failed for several
+// rounds while the cellular side is healthy. It never reboots when usbnet is
+// not ECM or when the modem has no IPv4 bearer, because then the cause is
+// elsewhere and signal recovery owns the escalation.
+func (a *app) maybeRebootForStuckDHCP(usbnetResp string) {
+	pdpResp, err := a.usbAT.Command("AT+CGPADDR=1", 3*time.Second)
+	if err != nil {
+		return
+	}
+	if !modemBearerReadyForDHCP(usbnetResp, pdpResp) {
+		a.dhcpFailRounds = 0
+		return
+	}
+	a.dhcpFailRounds++
+	log.Printf("cellular DHCP repair: module bearer is up but DHCP failed %d/%d rounds", a.dhcpFailRounds, stuckDHCPRoundsBeforeReboot)
+	if a.dhcpFailRounds < stuckDHCPRoundsBeforeReboot {
+		return
+	}
+	a.recoveryMu.Lock()
+	defer a.recoveryMu.Unlock()
+	if a.usbAT == nil || time.Since(a.lastModemReboot) < stuckDHCPRebootInterval {
+		return
+	}
+	a.lastModemReboot = time.Now()
+	a.dhcpFailRounds = 0
+	log.Printf("cellular DHCP repair: module DHCP server stuck; rebooting module (AT+CFUN=1,1)")
+	_, _ = a.usbAT.Command("AT+CFUN=1,1", 3*time.Second)
+	a.markUSBATDetached("cellular DHCP repair reboot")
+}
+
+// modemBearerReadyForDHCP reports whether the module is in ECM mode and holds
+// a non-zero IPv4 address on PDP context 1, i.e. it should be serving DHCP.
+func modemBearerReadyForDHCP(usbnetResp, pdpResp string) bool {
+	if !regexp.MustCompile(`"usbnet",\s*1\b`).MatchString(usbnetResp) {
+		return false
+	}
+	for _, addr := range parsePDPAddresses(pdpResp) {
+		ip := net.ParseIP(addr)
+		if ip != nil && ip.To4() != nil && !ip.IsUnspecified() {
+			return true
 		}
 	}
+	return false
 }
 
 // findUnprovisionedUSBModemInterface returns the en* interface that looks like
